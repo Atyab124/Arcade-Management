@@ -15,6 +15,7 @@
     "lint": "pnpm -r lint",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
+    "setup": "bash scripts/setup.sh",
     "db:migrate": "pnpm --filter @arcade/db migrate",
     "db:seed": "pnpm --filter @arcade/db seed",
     "db:reset": "pnpm --filter @arcade/db reset"

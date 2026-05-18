@@ -1,0 +1,26 @@
+{
+  "name": "@arcade/sync-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@arcade/db": "workspace:*",
+    "@arcade/lib": "workspace:*",
+    "@arcade/types": "workspace:*",
+    "dotenv": "^16.4.5",
+    "google-auth-library": "^9.7.0",
+    "googleapis": "^133.0.0",
+    "pino": "^8.19.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.1",
+    "vitest": "^1.4.0"
+  }
+}

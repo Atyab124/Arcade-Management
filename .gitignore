@@ -1,0 +1,29 @@
+node_modules/
+dist/
+build/
+.turbo/
+*.tsbuildinfo
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+coverage/
+.nyc_output/
+
+.DS_Store
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Prisma generated client
+packages/db/src/generated/
+
+# Local docker volumes
+infra/data/

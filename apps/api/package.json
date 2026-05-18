@@ -1,0 +1,42 @@
+{
+  "name": "@arcade/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@arcade/db": "workspace:*",
+    "@arcade/lib": "workspace:*",
+    "@arcade/types": "workspace:*",
+    "@arcade/whatsapp": "workspace:*",
+    "bcryptjs": "^2.4.3",
+    "bullmq": "^5.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.2",
+    "pino": "^8.19.0",
+    "pino-http": "^9.0.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/node": "^20.11.30",
+    "supertest": "^6.3.4",
+    "@types/supertest": "^6.0.2",
+    "tsx": "^4.7.1",
+    "vitest": "^1.4.0"
+  }
+}

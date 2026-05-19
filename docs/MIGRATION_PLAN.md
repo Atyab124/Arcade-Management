@@ -1,8 +1,25 @@
 # Arcade-Management — Production Migration Plan
 
-**Version:** 1.0 — Proposed
+**Version:** 1.1 — Decisions locked in
 **Date:** 2026-05-19
-**Status:** Draft for review
+**Status:** Approved scope; ready to execute
+
+---
+
+## 0. Decisions log (resolves §8 open questions)
+
+| # | Decision | Plan impact |
+|---|---|---|
+| Q1 | **Single-tenant only** at launch | Drop `user_tenants` table (C2). Token Hook reads `tenant_id` from `app_metadata` directly. No tenant-picker UI (skip C4, C8d). Workstream C reduces from 7–10 → **5–7 dev-days**. |
+| Q2 | **Supabase Pro ($25/mo) for prod**, free for dev | Plan unchanged. PITR + daily backups + custom SMTP all available. |
+| Q3 | **Default domains** (`arcade-api.fly.dev`, `*.vercel.app`) | Drop PF8 (DNS). Meta accepts `.fly.dev` webhook URLs. |
+| Q4 | **Build receipt PDFs + CSV exports per PRD** | New **Workstream G** added below. Native ESC/POS chosen. |
+| Q5 | **Hard-delete Trengo** pre-launch | A12 stays as-is. No feature flag. |
+| Q6 | **Singapore-only** | No multi-region work. Defer until ~$1k MRR. |
+| Q7 | **Build correct scaling pattern from day 1** | Replace `setInterval` with **BullMQ repeatable jobs**. Add `tenantId` to every job payload. +0.5 day to Workstream D. Removes "scheduler must be single-instance" constraint. |
+| Q8 | **12-month audit retention + nightly partition-drop** | Added as **F6** in Workstream F. |
+
+**Revised total effort: ~20–27 dev-days** (was 18–25; net +2 from Workstream G, –2 from Workstream C simplification, +0.5 from scheduler rework).
 
 ---
 
@@ -12,7 +29,7 @@
 - Drop Trengo; ship a **Meta WhatsApp Cloud API** client behind the existing `@arcade/whatsapp` package interface so callers (`apps/api/src/services/whatsapp.ts`, `apps/scheduler/src/jobs/whatsapp-worker.ts`, `apps/api/src/routes/webhooks.ts`) change minimally.
 - Re-key RLS from `current_setting('app.tenant_id')::uuid` to `(auth.jwt() ->> 'tenant_id')::uuid` and replace `withTenant(...)` connection-GUC plumbing with **stateless JWT-based tenant scoping**. Workers continue to use a `service_role` connection (BYPASSRLS) with explicit tenant filters.
 - Pre-launch (zero production users), so no user-data backfill; auth swap is breaking but acceptable. The hardest piece is the **Custom Access Token Hook** that injects `tenant_id` + `role` into JWTs by reading a new `user_tenants` table.
-- Total estimated effort: **~18–24 dev-days** for a single experienced engineer, dominated by the auth swap (Workstream C: 7–10 days) and deployment plumbing (Workstream D: 5–7 days).
+- Total estimated effort: **~20–27 dev-days** for a single experienced engineer, dominated by the auth swap (Workstream C: 5–7 days), deployment plumbing (Workstream D: 5.5–7.5 days), and receipt printing + exports (Workstream G: 3–4 days).
 
 ---
 
@@ -235,32 +252,32 @@ Touchpoints to migrate (already verified):
 - **Magic link template:** customize subject and body to brand iFun City / arcade-management.
 - **Token lifetimes:** keep defaults (access 1h, refresh 60d) — adequate for SMB SaaS.
 
-#### C2. Database: introduce `user_tenants` and slim `users`
+#### C2. Database: slim `users`, no `user_tenants` (single-tenant decision)
 
 Create new Prisma migration `packages/db/prisma/migrations/20260520_000002_supabase_auth/migration.sql`:
 
-- `CREATE TABLE user_tenants ( id UUID PK, supabase_user_id UUID NOT NULL, tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, role TEXT NOT NULL CHECK (role IN ('admin','manager','staff')), is_default BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE (supabase_user_id, tenant_id) )`. Index on `(supabase_user_id)` and `(tenant_id)`.
 - `ALTER TABLE users DROP COLUMN password_hash` (Supabase owns credentials).
 - Add `users.supabase_user_id UUID UNIQUE` so we can link our profile rows to `auth.users.id`.
-- Drop our composite PK; switch `users` PK to `(tenant_id, id)` retained (Prisma model unchanged) but allow `id` to optionally equal `supabase_user_id` for new users. (Decision: set `users.id := supabase_user_id` for new tenant memberships so the existing `req.auth.userId` references continue to map cleanly. Document.)
+- Decision: set `users.id := supabase_user_id` for new users so the existing `req.auth.userId` references continue to map cleanly. Document in the migration comment.
 - `DROP TABLE refresh_tokens` — Supabase manages refresh on the client.
 - Backfill: zero rows in prod (pre-launch). For the seed tenant, the new seed will recreate users via the Admin API (see C7).
+
+**No `user_tenants` table** (Q1 decision). `tenant_id` + `app_role` live in `auth.users.app_metadata` and get pulled into the JWT by the Token Hook directly — no extra DB lookup, simpler hook function, no tenant-picker UI to maintain. If/when we onboard a second tenant, we add the `user_tenants` table then; the Token Hook function body changes but the JWT claim names stay stable.
 
 Prisma schema changes in `packages/db/prisma/schema.prisma:31–65`:
 - Remove `passwordHash` from `User`.
 - Remove `RefreshToken` model entirely.
-- Add new model `UserTenant` mapping to `user_tenants`.
 
-#### C3. Custom Access Token Hook
+#### C3. Custom Access Token Hook (simplified — single tenant)
 
 This is the keystone piece. Supabase supports a Postgres function hook that mutates the JWT claims when a token is issued.
 
 Create migration `packages/db/prisma/migrations/20260520_000003_auth_hook/migration.sql`:
 
 ```sql
--- Returns the claims object Supabase will sign into the access token.
--- Reads user_tenants for the user, picks the active tenant (per app_metadata.active_tenant_id
--- if set, else the is_default row), and emits tenant_id + role.
+-- Reads tenant_id + app_role from auth.users.app_metadata and copies them to JWT claims.
+-- No DB lookup beyond auth.users itself. When we add multi-tenancy, this function gets
+-- swapped for one that reads from a user_tenants table.
 CREATE OR REPLACE FUNCTION public.custom_access_token_hook(event jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -270,35 +287,16 @@ SET search_path = public
 AS $$
 DECLARE
   claims jsonb := event -> 'claims';
-  uid uuid := (claims ->> 'sub')::uuid;
-  active_tid uuid;
-  row record;
+  app_meta jsonb := event -> 'user_metadata';
+  tid text := app_meta ->> 'tenant_id';
+  role text := app_meta ->> 'app_role';
 BEGIN
-  -- Active tenant preference comes from app_metadata.active_tenant_id (set by API via Admin API
-  -- when the user picks a tenant; defaults to NULL → use is_default).
-  active_tid := NULLIF(((event -> 'user_metadata') ->> 'active_tenant_id'), '')::uuid;
-
-  IF active_tid IS NOT NULL THEN
-    SELECT tenant_id, role INTO row
-      FROM user_tenants
-     WHERE supabase_user_id = uid AND tenant_id = active_tid
-     LIMIT 1;
+  IF tid IS NOT NULL THEN
+    claims := claims || jsonb_build_object('tenant_id', tid);
   END IF;
-
-  IF row IS NULL THEN
-    SELECT tenant_id, role INTO row
-      FROM user_tenants
-     WHERE supabase_user_id = uid
-     ORDER BY is_default DESC, created_at ASC
-     LIMIT 1;
+  IF role IS NOT NULL THEN
+    claims := claims || jsonb_build_object('app_role', role);
   END IF;
-
-  IF row IS NOT NULL THEN
-    claims := claims
-      || jsonb_build_object('tenant_id', row.tenant_id::text)
-      || jsonb_build_object('app_role', row.role);
-  END IF;
-
   RETURN jsonb_set(event, '{claims}', claims);
 END;
 $$;
@@ -311,13 +309,9 @@ Then via Supabase dashboard → Authentication → Hooks → **Custom Access Tok
 
 Note on claim names: we use `tenant_id` and `app_role` (not `role`) — Supabase reserves the top-level `role` claim for the Postgres role (`authenticated`/`anon`). Overwriting `role` breaks RLS entirely.
 
-#### C4. Switching active tenant (multi-tenant users)
+#### C4. ~~Switching active tenant~~ (skipped per Q1)
 
-For users in >1 tenant:
-
-- **C4a.** Add API endpoint `POST /auth/active-tenant` body `{ tenantId }`. Handler (in new `apps/api/src/routes/auth.ts`) uses the Supabase Admin client to call `auth.admin.updateUserById(userId, { user_metadata: { active_tenant_id: tenantId } })`. Frontend then calls `supabase.auth.refreshSession()` to get a new access token with the updated claim.
-- **C4b.** Add `GET /auth/tenants` returning the list of `user_tenants` rows for the current user (after JWT verify, before tenant-context middleware — so we read from service_role).
-- **C4c.** Frontend: on login, if user has >1 tenant, show a picker. Persist last-used to `localStorage` and `supabase.auth.updateUser({ data: { active_tenant_id } })`.
+Deferred until we onboard tenant #2. When that happens, add the `user_tenants` table, update the Token Hook function body, and add the picker UI. No code shipped today.
 
 #### C5. RLS policy rekey
 
@@ -381,7 +375,7 @@ Local dev: developers will receive magic-link emails to demo emails. To skip ema
   - Replace `(window as any).__apiToken` global (`auth.tsx:99–106`) with `session.access_token` lookup.
 - **C8b. Rewrite `apps/web/src/pages/LoginPage.tsx`** — email input + "Send magic link" button + "Check your email" state. Remove password field entirely.
 - **C8c. New page `apps/web/src/pages/AuthCallbackPage.tsx`** — handles `/auth/callback` route; reads the hash params and finalizes the session, then redirects to `/`.
-- **C8d. New page `apps/web/src/pages/SelectTenantPage.tsx`** — shown after login if `GET /auth/tenants` returns >1; submitting calls `POST /auth/active-tenant` then `supabase.auth.refreshSession()` and redirects to `/`.
+- **C8d.** ~~SelectTenantPage~~ — skipped per Q1.
 - **C8e. New env var on Vercel:** `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`.
 
 #### C9. Audit logging hooks
@@ -462,7 +456,7 @@ Three Dockerfiles, all multi-stage, Alpine, non-root, with healthcheck.
   - `[deploy] release_command = "pnpm --filter @arcade/db migrate"` — runs `prisma migrate deploy` against `DIRECT_DATABASE_URL` in a one-off VM before the new release boots. Critical: this requires the release command image to include the Prisma CLI and migrations folder (it does — same Dockerfile target).
   - `[scaling] min_machines_running = 1, auto_stop_machines = true` for dev; for prod `min = 1, max = 4`.
 - **`apps/scheduler/fly.toml`** (new):
-  - Single instance (`min=1, max=1`) — running multiple causes duplicate cron firings since `setInterval` in `apps/scheduler/src/main.ts:30–38` isn't locked.
+  - After D13 (BullMQ repeatable jobs): **safe to run 2+ instances** — Redis locks dedupe firings. Start with `min=1, max=2` for HA.
   - No HTTP service. Add `[[services]]` with internal port 3001 wired to a tiny HTTP `/healthz` handler (D3b).
   - No release_command (api's already runs migrations).
 - **`apps/sync-worker/fly.toml`** (new): Single instance; similar shape; no release_command.
@@ -576,6 +570,20 @@ Pino is already wired (`apps/api/src/logger.ts`, `apps/scheduler/src/logger.ts`,
 
 For `GOOGLE_APPLICATION_CREDENTIALS`: currently `apps/sync-worker/src/main.ts:11–14` reads a file path. Update to accept either a path or an inlined JSON env var `GOOGLE_APPLICATION_CREDENTIALS_JSON` (parse directly). Add task to Workstream A/F.
 
+#### D13. Scheduler rework — BullMQ repeatable jobs (Q7)
+
+**Goal:** Replace `setInterval`-based cron in `apps/scheduler/src/main.ts:30–38` with BullMQ's repeatable job pattern. Adds **0.5 dev-day** but unlocks horizontal scaling and removes the single-instance constraint.
+
+- **D13a. Refactor `apps/scheduler/src/main.ts`.** Remove `setInterval` blocks. On boot, enqueue **repeatable jobs** via `queue.add(name, payload, { repeat: { every: ms } | { pattern: cronExpr } })`. BullMQ stores these in Redis; duplicate `add` calls with the same `repeat` config are idempotent — safe to run on every scheduler boot.
+- **D13b. Per-tenant job sharding (forward compatibility).** Every job payload includes `{ tenantId, ... }`. At launch this is always iFun's tenantId. When we add tenants, the same code paths shard automatically because each `tenantId` enqueues distinct repeatable jobs (distinct `jobId` = `${name}:${tenantId}`).
+- **D13c. Idempotency keys.** Use `jobId: ${name}:${tenantId}:${slot}` (slot = floor(now / interval)) on `queue.add` so a duplicate enqueue from another scheduler instance is a no-op.
+- **D13d. Worker side.** Existing workers (`whatsapp-worker.ts`, `sync-worker`) already consume by job name — no change needed. Add `tenantId` extraction to the start of each worker handler.
+- **D13e. Tests.** Add `apps/scheduler/src/__tests__/repeatable-jobs.test.ts` — verify `jobId` collisions are deduped and the right number of jobs land in the queue after two scheduler boots.
+
+**Acceptance:** Running two `apps/scheduler` instances locally for 5 minutes produces exactly one execution per interval per job, verified via `BullMQ`'s `getCompleted()` and timestamps.
+
+---
+
 #### D11. Rollback strategy
 
 - **Fly:** `flyctl releases rollback <version>` — instant. Each release is an immutable image.
@@ -641,6 +649,60 @@ For `GOOGLE_APPLICATION_CREDENTIALS`: currently `apps/sync-worker/src/main.ts:11
 - **F3.** Remove `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `JWT_ACCESS_TTL_SECONDS`, `JWT_REFRESH_TTL_SECONDS` from `apps/api/src/config.ts` and `.env.example`.
 - **F4.** Remove `bcryptjs` from `apps/api/package.json` and `packages/db/package.json` once no longer used.
 - **F5.** Remove `RefreshToken` Prisma model + its DB table via final migration.
+- **F6.** **Audit log retention — 12-month partition-drop (Q8).** Convert `audit_log` to a monthly partitioned table; add a nightly BullMQ repeatable job in scheduler that drops partitions older than 12 months. Mirror the same for `wa_messages` and `consent_events` (PRD §11.3 requires 12-month minimum). Migration `20260521_000002_audit_partitions/migration.sql`. New worker `apps/scheduler/src/jobs/retention-worker.ts`. Tests: insert old rows, run worker, verify drop. **Effort: included in F's 0.5 day budget — promote to 1 day if more retention tables need partitioning.**
+
+---
+
+### Workstream G — Receipt PDFs + CSV exports + ESC/POS printer (Q4)
+
+**Goal:** Ship the PRD's receipt printing and reports-export features. Uses Supabase Storage for blob persistence; ESC/POS native helper for direct thermal-printer drive.
+
+**Effort:** 3–4 dev-days.
+
+#### G1. Receipt PDF generation
+
+- **G1a. Add `pdfkit` to `packages/lib`.** New file `packages/lib/src/receipts.ts` exporting `generateReceiptPdf(transaction): Promise<Buffer>`. Layout: store name, transaction id, datetime, line items table (item, qty, unit price, total), payment method, totals (subtotal, tax, grand total), QR code linking to digital receipt URL.
+- **G1b. Upload to Storage.** After PDF generation, upload to `receipts/tenants/{tenantId}/{transactionId}.pdf` via the `packages/lib/src/storage.ts` wrapper from B6. Persist returned object path on the `transactions` row in a new column `receipt_storage_path`.
+- **G1c. Schema migration.** `ALTER TABLE transactions ADD COLUMN receipt_storage_path TEXT;` and `ADD COLUMN receipt_generated_at TIMESTAMPTZ;`. Migration `20260520_000005_receipts/migration.sql`.
+- **G1d. POS route update.** `POST /pos/transactions` (in `apps/api/src/routes/pos.ts`) — after successful transaction commit, enqueue a `generate-receipt` job to BullMQ (don't block the API). Worker generates + uploads + updates row. Response returns `{ transaction, receiptPending: true }` immediately; frontend polls `GET /pos/transactions/:id/receipt` until `receipt_storage_path` is set, then fetches signed URL.
+- **G1e. Signed URL endpoint.** `GET /pos/transactions/:id/receipt-url` returns `{ url, expiresAt }` via `storage.signedUrl(path, 3600)`. Auth-checked (must belong to tenant).
+
+#### G2. ESC/POS native printing
+
+- **G2a. Decision: thin helper agent or embedded.** Build a small Electron-based helper app **OR** a Node.js system tray app **OR** rely on a USB-connected printer driven via the browser's WebUSB API. After research: **WebUSB has Chromium-only support and requires HTTPS + user gesture per session** — fragile for a kiosk POS that runs all day. **Decision: Node.js system tray helper** (~200 LoC) using `node-thermal-printer` or `escpos` npm package. Distributed as a signed `.exe` / `.dmg`.
+- **G2b. New app `apps/printer-agent`.** Single-purpose Node.js process:
+  - Listens on `localhost:7777` for `POST /print` `{ pdfUrl, copies?, drawerKick? }`.
+  - Downloads the PDF from signed URL (already in `apps/web` flow).
+  - Converts PDF → ESC/POS commands via `pdf2pic` + raster mode, OR renders the receipt directly via `escpos` library (faster, smaller binary). **Recommendation: render directly via `escpos` — skip PDF intermediate.**
+  - Configurable printer: USB vendor/product ID, network IP, or serial port via local `~/.arcade-printer.json` config.
+- **G2c. Web app integration.** `apps/web/src/pages/PosPage.tsx` — after transaction success, `POST http://localhost:7777/print` with the receipt payload. Fallback to browser print dialog if agent unreachable (`fetch` fails). Show a "Printer offline" badge in the UI when agent is down.
+- **G2d. Auto-launch on Windows.** Document in `docs/PRINTER_AGENT.md`: install + add to startup folder. Mac/Linux: similar.
+- **G2e. Drawer-kick support.** ESC/POS command `0x1B 0x70 0x00 0x32 0xFA` opens the cash drawer wired through the printer's RJ12 port. Toggle via `drawerKick: true` in the print payload (default true for cash transactions, false for digital).
+
+#### G3. CSV exports
+
+- **G3a. Async export queue.** New BullMQ queue `exports` in `apps/api/src/queues.ts`. New worker `apps/scheduler/src/jobs/export-worker.ts`.
+- **G3b. New routes** in `apps/api/src/routes/reports.ts`:
+  - `POST /reports/exports` body `{ type: 'transactions' | 'customers' | 'bookings' | 'wallet-ledger', from, to, filters? }` → enqueues a job, returns `{ exportId, status: 'pending' }`.
+  - `GET /reports/exports/:id` → returns `{ status: 'pending' | 'ready' | 'failed', downloadUrl?, expiresAt? }`.
+- **G3c. Worker logic.** Stream rows from Prisma using `findManyCursor`, format to CSV via `papaparse`, upload to `exports/tenants/{tenantId}/{exportId}.csv`. Update an `exports` table row to `ready` with the path.
+- **G3d. New `exports` table.** Migration `20260520_000006_exports/migration.sql` — `id UUID PK, tenant_id UUID NOT NULL, requested_by UUID, type TEXT, status TEXT, filters JSONB, row_count INT, storage_path TEXT, error TEXT, created_at, completed_at`. RLS policies via the existing helper function.
+- **G3e. Email/WhatsApp notification on ready.** Optional — for now, frontend polls `GET /reports/exports/:id` every 2s while a modal is open. Push notifications a future improvement.
+
+#### G4. Reports UI
+
+- **G4a. New page `apps/web/src/pages/ReportsPage.tsx`** — list past exports + "Generate new" button with filters. Polls status.
+- **G4b. New page `apps/web/src/pages/DashboardPage.tsx`** (if doesn't exist) — summary cards from `GET /reports/daily` for today's metrics (already in PRD §6).
+
+**Risks**
+- ESC/POS over USB on Windows often needs WinUSB driver installation (vendor-specific) — document common printer models (Epson TM-T20, Star TSP100) and their drivers in `docs/PRINTER_AGENT.md`.
+- Large CSV exports (>500k rows) could exhaust worker memory — stream rows, never `findMany` whole tables.
+- Signed URLs for exports expire — frontend must regenerate if user opens an old link.
+
+**Acceptance criteria**
+- Completing a POS sale produces a receipt PDF in Storage within 5s and prints via the agent on a connected Epson TM-T20.
+- Generating a transactions CSV export for a 30-day range with ~10k rows completes in <30s and downloads via signed URL.
+- Agent gracefully reports offline status to the web app when the printer USB cable is disconnected.
 
 ---
 
@@ -654,15 +716,16 @@ Sequential dependencies are minimal; the critical path is C → cutover. A and B
    - Track 1: **Workstream B (Supabase setup)** — provision project, capture URLs, run existing migrations as-is to verify schema works on Supabase. Wire up Storage buckets.
    - Track 2: **Workstream A (WhatsApp swap)** — Meta dev account, sandbox phone number, build `meta-client.ts`, swap worker and webhook. Test against sandbox.
 2. **Week 2**
-   - **Workstream C (Auth migration)** — full focus, single-engineer track. Land in a feature branch with the new RLS migrations, middleware rewrite, frontend rewrite, seed rewrite. Run integration tests in CI against a Supabase shadow project.
+   - **Workstream C (Auth migration)** — focused single-engineer track. Land in a feature branch with the new RLS migrations, middleware rewrite, frontend rewrite, seed rewrite. Run integration tests in CI against a Supabase shadow project. Simpler now (no `user_tenants`).
 3. **Week 3**
-   - **Workstream D (Deployment)** — Dockerfiles, fly.tomls, GitHub Action, Sentry, healthchecks. Deploy api + workers to Fly dev environment first. Verify with smoke tests.
-   - **Workstream E (Docs)** — write in parallel with D.
+   - **Workstream D (Deployment + scheduler rework)** — Dockerfiles, fly.tomls, BullMQ repeatable jobs (D13), GitHub Action, Sentry, healthchecks. Deploy api + workers to Fly dev environment first.
+   - **Workstream G (Receipts + exports)** — kick off in parallel; PDF + CSV pieces don't depend on D, only the printer-agent integration needs `apps/web` deployed.
+   - **Workstream E (Docs)** — in parallel.
 4. **Week 4**
    - Production cutover: deploy to prod Fly + Vercel, point Meta webhook at prod URL, switch Meta WABA to production.
-   - **Workstream F (Cleanup)** — drop Trengo columns, remove dead code.
+   - **Workstream F (Cleanup + audit retention)** — drop Trengo columns, partition `audit_log`, deploy retention worker.
 
-Total elapsed: ~4 weeks for one engineer at ~70% utilization, or ~2.5 weeks at full focus.
+Total elapsed: ~4–5 weeks for one engineer at ~70% utilization, or ~3 weeks at full focus.
 
 ---
 
@@ -692,7 +755,7 @@ These need to be started **before** Workstream A/C, as some have multi-day delay
 - [ ] **PF5.** **Fly.io org** — create org `arcade-management`. Add billing card. `flyctl orgs apps create arcade-api`/`-scheduler`/`-sync-worker` in region `sin`.
 - [ ] **PF6.** **Vercel project** — link the Github repo. Set root dir to `apps/web`. Add env vars (D4).
 - [ ] **PF7.** **Upstash account** — create Redis DB in `ap-southeast-1`. Pay-As-You-Go for dev, Pro for prod.
-- [ ] **PF8.** **Domain + DNS** — register `app.ifuncity.com`, point at Vercel; `api.ifuncity.com` CNAME → `arcade-api.fly.dev` (or use Fly's free `.fly.dev` for staging).
+- [x] ~~**PF8.** Domain + DNS~~ — **dropped per Q3.** Use default `arcade-api.fly.dev` and `*.vercel.app` for launch. Add custom domain post-launch if needed.
 - [ ] **PF9.** **Sentry org** — create 4 projects, capture DSNs.
 - [ ] **PF10.** **Transactional email provider for Supabase Auth** — Resend account (or Postmark). Domain verification (SPF/DKIM) — **2–24h** to propagate. SMTP creds into Supabase Auth settings.
 - [ ] **PF11.** **GCP service account** — for Sheets sync (already in PRD). Generate JSON key. Will be stored as `GOOGLE_APPLICATION_CREDENTIALS_JSON` Fly secret.
@@ -711,29 +774,30 @@ See D12. Summary:
 
 ---
 
-## 8. Open questions needing user decision
+## 8. Open questions — RESOLVED (see §0 for decisions)
 
-Block execution start on these:
+All 8 questions answered. Full decisions log at top of doc. Summary:
 
-- **Q1.** **Single-tenant or multi-tenant users at launch?** iFun City alone implies single. But the Token Hook (C3) and `user_tenants` table (C2) are designed for multi. Confirm: do we want a single user signed into the iFun City admin to also be able to switch tenants if/when we onboard customer #2, or are we punting that until needed? **Recommendation:** ship the `user_tenants` table now (cheap), keep tenant-picker UI simple (auto-select if only one) — pays for itself the day we onboard tenant 2.
-- **Q2.** **Supabase Pro from day 1, or free tier for dev?** PITR and SMTP customization need Pro. **Recommendation:** Pro for prod ($25/mo), free for dev (with 7-day inactivity-pause as a known issue).
-- **Q3.** **Domain name confirmed?** `app.ifuncity.com` and `api.ifuncity.com` — does iFun own this? If not, what's the temporary domain?
-- **Q4.** **Where do receipt PDFs and CSV exports get used today?** I see `Supabase Storage` is in scope (B5) but nothing in the codebase currently writes a PDF or CSV. Is this a stub for future, or is there an unbuilt receipt-printing flow we should plan for explicitly?
-- **Q5.** **Trengo decommission plan.** Currently no production usage (placeholder hsm_ids in seed). Confirm: hard delete `trengo-client.ts` and never look back, or keep behind a feature flag for 30 days? **Recommendation:** hard delete pre-launch.
-- **Q6.** **Multi-region readiness?** Singapore-only is fine for iFun City but if next-tenant is Bangkok or Manila, the latency is OK; if it's KL, even better. Decide whether to plan multi-region Fly + Supabase read replica now or defer to ~$1k MRR.
-- **Q7.** **Worker scaling: single-instance or per-tenant?** Scheduler's `setInterval` jobs (`apps/scheduler/src/main.ts:30–38`) assume one instance globally. As we scale past ~50 tenants, the 15-min sync tick will run too long. Plan for tenant-sharded workers post-launch — out of scope for this migration but noted as a follow-up.
-- **Q8.** **Audit log retention.** Currently unbounded. With Supabase Pro the DB is cheap up to a point; do we set a 12-month retention policy now (per PRD § 11.3 WhatsApp 12-month minimum) or defer? **Recommendation:** add a nightly partition-drop job in Workstream F as a follow-up.
+- Q1 — Single-tenant ✅ (drop `user_tenants`)
+- Q2 — Supabase Pro for prod, free for dev ✅
+- Q3 — Default domains ✅
+- Q4 — Build receipts + exports ✅ (new Workstream G, native ESC/POS)
+- Q5 — Hard-delete Trengo ✅
+- Q6 — Singapore-only ✅
+- Q7 — Build scaling pattern day 1 ✅ (BullMQ repeatable jobs in D13)
+- Q8 — 12-month partition-drop ✅ (F6)
 
 ---
 
 ## Effort summary
 
-| Workstream | Estimate (dev-days) |
-|---|---|
-| A — WhatsApp swap | 3–4 |
-| B — Supabase setup | 2 |
-| C — Auth migration | 7–10 |
-| D — Deployment infra | 5–7 |
-| E — Docs | 1–2 |
-| F — Cleanup | 0.5 |
-| **Total** | **18.5–25.5** |
+| Workstream | Estimate (dev-days) | Notes |
+|---|---|---|
+| A — WhatsApp swap (Trengo → Meta) | 3–4 | Unchanged |
+| B — Supabase setup | 2 | Unchanged |
+| C — Auth migration | **5–7** | –2 days (no `user_tenants`, no tenant-picker) |
+| D — Deployment infra + scheduler rework | **5.5–7.5** | +0.5 day (BullMQ repeatable jobs, D13) |
+| E — Docs | 1–2 | Unchanged |
+| F — Cleanup + audit retention | **1** | +0.5 (F6 partition-drop) |
+| **G — Receipts + CSV exports + ESC/POS printer** | **3–4** | NEW (per Q4) |
+| **Total** | **20.5–27.5** | |
